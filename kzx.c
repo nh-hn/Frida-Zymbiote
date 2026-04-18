@@ -72,6 +72,7 @@ pid_t getZygotePid(char* processname){
         return -1;
     }
     struct dirent* entry;
+	pid_t zpid = 0;
     while((entry = readdir(dir)) != NULL){
         if(!isdigit(entry->d_name[0])){ continue;} // 只处理数字开头目录
         char cmdline_path[64];
@@ -90,12 +91,11 @@ pid_t getZygotePid(char* processname){
             // cmdline 是用 '\0' 分隔的参数，所以可以直接查找进程名
 //            printf("%s %s \n",cmdline,processname);
             if (strstr(cmdline, processname) != NULL) {
-                closedir(dir);
-                return (pid_t) atoi(entry->d_name);
+                zpid = (pid_t) atoi(entry->d_name);
             }
         }
     }
-    return 0;
+    return zpid;
 }
 //setp2:从zygote64进程读出libandroid_runtime基地址,找到setArgV0符号地址,
 //收集artmethod存放的可疑maps，找到libstagefright.so的最后一页可执行页，作为跳板空间
@@ -144,22 +144,35 @@ uintptr_t getheaplist(pid_t zygote_pid,targetso* t){
     return 0;
 }
 uintptr_t getsobase(char* soname,pid_t zygote_pid){
-    char buffer[64];
-    sprintf(buffer,"/proc/%d/maps",zygote_pid);
-    FILE* fp = fopen(buffer,"r");
-    if(!fp){
-        printf("maps读取失败 \n");
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", zygote_pid);
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return 0;
     }
+
     char line[512];
-    uintptr_t addr_start = 0;
-    while(fgets(line,sizeof(line),fp)){
-        if (strstr(line, soname)) { // 找到包含 soname 的行
-            // 解析起始地址
-            sscanf(line, "%lx-", &addr_start);
-            fclose(fp);
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (!strstr(line, soname)) {
+            continue;
+        }
+
+        uintptr_t start = 0, offset = 0;
+        char perms[5] = {0};
+
+        // 注意：这里用 %lx 解析十六进制地址
+        if (sscanf(line, "%lx-%*lx %4s %lx", &start, perms, &offset) == 3) {
+            if (offset == 0 && perms[3] != 's') {
+                fclose(fp);
+                return start;
+            }
         }
     }
-    return addr_start;
+
+    fclose(fp);
+    return 0;
 }
 //setp3:扫描可疑内存区域列表，找到setArgV0 artmethod enter_point地址
 uintptr_t getFnpostion(uintptr_t symbol,pid_t zygote_pid){
@@ -322,7 +335,7 @@ int main(int argc,char* argv[]){
     printf("pp:0x%lx",pp);
     //step4: 利用命令的方式将需注入的so文件写入目标app的catch目录，绕过selinux安全策略
     char targetDir[128];
-    sprintf(targetDir,"/data/data/%s/cache/lib%d.so",package_name,yuid);
+    sprintf(targetDir,"/data/data/%s/cache/liblizwan.so",package_name);
     char cpcmd[128];
     sprintf(cpcmd,"cp %s %s",so_path,targetDir);
     system(cpcmd);
