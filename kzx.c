@@ -9,6 +9,7 @@
 #include <linux/mman.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include "sys/syscall.h"
 #include "stub.h"
 #include "elf.h"
 
@@ -332,25 +333,44 @@ int main(int argc,char* argv[]){
     //把hook的函数给读出来
     char remote_pattern[] = "/xzxzxrack87654321";
     uintptr_t pp = (uintptr_t) memmem(stub_binary, stub_binary_size, remote_pattern, sizeof remote_pattern);
-    printf("pp:0x%lx",pp);
+    printf("pp:0x%lx\n",pp);
     //step4: 利用命令的方式将需注入的so文件写入目标app的catch目录，绕过selinux安全策略
     char targetDir[128];
+    char configdir[128];
     sprintf(targetDir,"/data/data/%s/cache/liblizwan.so",package_name);
+    sprintf(configdir,"/data/data/%s/cache/liblizwan.config.so",package_name);
     char cpcmd[128];
+    char cp1cmd[128];
     sprintf(cpcmd,"cp %s %s",so_path,targetDir);
+    sprintf(cp1cmd,"cp %s %s","/data/local/tmp/liblizwan.config.so",configdir);
     system(cpcmd);
+    system(cp1cmd);
     char chown_cmd[128];
+    char chown_1cmd[128];
     sprintf(chown_cmd,"chown %d:%d  %s",yuid,yuid,targetDir);
+    sprintf(chown_1cmd,"chown %d:%d  %s",yuid,yuid,configdir);
     system(chown_cmd);
+    system(chown_1cmd);
     so_path = targetDir;
     uintptr_t shellcode_base = ts.end - getpagesize();
     uintptr_t original_ptr;
+    //修改为系统调用,读取函数指针
+    struct iovec local_iov,remote_iov;
+    local_iov.iov_base = &original_ptr;
+    local_iov.iov_len  = sizeof(uintptr_t);
+    remote_iov.iov_base = (void*)enter_point;
+    remote_iov.iov_len  = sizeof(uintptr_t);
     char mempath[128];
     sprintf(mempath,"/proc/%d/mem",zygote_pid);
     int mem_fd = open(mempath, O_RDWR);
-    pread(mem_fd,&original_ptr,sizeof(uintptr_t),enter_point);
+//    pread(mem_fd,&original_ptr,sizeof(uintptr_t),enter_point);
+    ssize_t nread = syscall(__NR_process_vm_readv,zygote_pid,&local_iov, 1,&remote_iov, 1,0);
+    if(nread != sizeof(uintptr_t)){
+        printf("process_vm_readv error\n");
+        return 0;
+    }
     printf("[*] Verification: Slot 0x%lx contains 0x%lx shellcode base  0x%lx\n", enter_point, original_ptr,shellcode_base);
-
+    //备份 shellcode 区域
     uint8_t *original_shellcode_area = malloc(stub_binary_size);
     pread(mem_fd,(uint8_t*)original_shellcode_area,stub_binary_size,shellcode_base);
 
@@ -374,22 +394,24 @@ int main(int argc,char* argv[]){
     uintptr_t addr_dlopen = libdlbase + getSymbolOffset("/system/lib64/libdl.so","dlopen");
     printf("dlopen 0x%lx \n",addr_dlopen);
 
-
     tStub->log_print = (int (*)(int, const char*, const char*, ...))addr_log;
     tStub->getuid = (uid_t (*)())addr_getuid;
     tStub->dlopen = (void* (*)(const char*, int))addr_dlopen;
-
     tStub->original_set_argv0 = (int (*)(JNIEnv*,jobject,jstring))symbol_addr;
     tStub->slot_addr = enter_point;
 
+    //写入shellcode
     ssize_t written_code = pwrite(mem_fd,stub_binary,stub_binary_size,shellcode_base);
     if(written_code != stub_binary_size){
         printf("写入shellcode失败 \n");
+        return 0;
     }
+    //写入artmethod
     uintptr_t new_ptr = shellcode_base;
     ssize_t written_ptr = pwrite(mem_fd, &new_ptr, sizeof(new_ptr), enter_point);
     if(written_ptr != sizeof(new_ptr)){
         printf("写入artmethod失败 \n");
+        return 0;
     }
     printf("[!] HOOK SUCCESS! art_method_slot now points to Shellcode.\n");
     kill(zygote_pid, SIGCONT);
@@ -410,13 +432,13 @@ int main(int argc,char* argv[]){
 
     printf("\n[*] Restoring Zygote memory...\n");
     kill(zygote_pid, SIGSTOP);
-
+    //恢复跳板区域与函数指针
     pwrite(mem_fd, &original_ptr, sizeof(original_ptr), enter_point);
     pwrite(mem_fd, original_shellcode_area, stub_binary_size, shellcode_base);
 
     kill(zygote_pid, SIGCONT);
 
-    close(mem_fd);
+//    close(mem_fd);
     printf("[+] Restore complete. Goodbye!\n");
 
 
